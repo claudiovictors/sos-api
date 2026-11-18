@@ -1,31 +1,33 @@
 package controllers
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
+	"context"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/mail"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/claudiovictors/api-rest/middleware"
 	"github.com/claudiovictors/api-rest/models"
+	"github.com/claudiovictors/api-rest/utils"
 	"github.com/gofiber/fiber/v3"
-	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
-const accessTokenDuration = 24 * time.Hour
-const refreshTokenDuration = 30 * 24 * time.Hour
+const (
+	accessTokenDuration  = 24 * time.Hour
+	refreshTokenDuration = 30 * 24 * time.Hour
+)
+
+var dummyPasswordHash = func() []byte {
+	hash, _ := bcrypt.GenerateFromPassword([]byte("unused-password"), bcrypt.DefaultCost)
+	return hash
+}()
 
 type AuthController struct {
-	db        *sql.DB
-	jwtSecret []byte
+	db           *sql.DB
+	jwtSecret    []byte
+	queryTimeout time.Duration
 }
 
 type credentials struct {
@@ -38,253 +40,230 @@ type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-type tokenClaims struct {
-	jwt.RegisteredClaims
-}
-
-func NewAuthController(db *sql.DB, secret string) (*AuthController, error) {
+func NewAuthController(db *sql.DB, secret string, timeout time.Duration) (*AuthController, error) {
 	if db == nil {
 		return nil, errors.New("database connection is required")
 	}
 	if len(secret) < 32 {
 		return nil, errors.New("AUTH_SECRET must contain at least 32 characters")
 	}
-
-	return &AuthController{db: db, jwtSecret: []byte(secret)}, nil
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return &AuthController{db: db, jwtSecret: []byte(secret), queryTimeout: timeout}, nil
 }
 
 func (a *AuthController) Store(c fiber.Ctx) error {
 	var input credentials
-	if err := json.Unmarshal(c.Body(), &input); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON body"})
+	if err := decodeBody(c, &input); err != nil {
+		return utils.Fail(c, fiber.StatusBadRequest, "invalid JSON body")
 	}
 
-	input.Name = strings.TrimSpace(input.Name)
-	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
-	if input.Name == "" || len(input.Name) > 100 || !validEmail(input.Email) ||
-		len(input.Password) < 8 || len(input.Password) > 72 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "name, valid email, and password (8-72 bytes) are required",
-		})
+	name, validName := utils.ValidateName(input.Name)
+	email := utils.NormalizeEmail(input.Email)
+	if !validName || !utils.ValidEmail(email) || !utils.ValidatePassword(input.Password) {
+		return utils.Fail(c, fiber.StatusBadRequest,
+			"name, valid email, and password (8-72 bytes) are required")
 	}
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create user"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create user")
 	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), a.queryTimeout)
+	defer cancel()
 
 	var user models.User
-	err = a.db.QueryRowContext(c.Context(),
+	err = a.db.QueryRowContext(ctx,
 		`INSERT INTO users (name, email, password_hash)
 		 VALUES ($1, $2, $3)
-		 RETURNING id, name, email, created_at`,
-		input.Name, input.Email, string(passwordHash),
-	).Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt)
+		 RETURNING id, name, email, role, is_active, created_at, updated_at`,
+		name, email, string(passwordHash),
+	).Scan(&user.ID, &user.Name, &user.Email, &user.Role, &user.IsActive, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
-		var sqlState interface{ SQLState() string }
-		if errors.As(err, &sqlState) && sqlState.SQLState() == "23505" {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email is already registered"})
+		if utils.IsUniqueViolation(err) {
+			return utils.Fail(c, fiber.StatusConflict, "email is already registered")
 		}
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create user"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create user")
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(user)
+	return utils.OK(c, fiber.StatusCreated, user.Public())
 }
 
 func (a *AuthController) Login(c fiber.Ctx) error {
 	var input credentials
-	if err := json.Unmarshal(c.Body(), &input); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON body"})
+	if err := decodeBody(c, &input); err != nil {
+		return utils.Fail(c, fiber.StatusBadRequest, "invalid JSON body")
 	}
 
-	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	email := utils.NormalizeEmail(input.Email)
+	ctx, cancel := context.WithTimeout(c.Context(), a.queryTimeout)
+	defer cancel()
+
 	var user models.User
 	var passwordHash string
-	err := a.db.QueryRowContext(c.Context(),
-		`SELECT id, name, email, created_at, password_hash
+	err := a.db.QueryRowContext(ctx,
+		`SELECT id, name, email, password_hash, role, is_active, created_at, updated_at
 		 FROM users WHERE email = $1`,
-		input.Email,
-	).Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt, &passwordHash)
+		email,
+	).Scan(&user.ID, &user.Name, &user.Email, &passwordHash, &user.Role, &user.IsActive, &user.CreatedAt, &user.UpdatedAt)
+
 	if errors.Is(err, sql.ErrNoRows) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid email or password"})
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(input.Password))
+		return utils.Fail(c, fiber.StatusUnauthorized, "invalid email or password")
 	}
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not authenticate user"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not authenticate user")
 	}
-	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.Password)) != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid email or password"})
+	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.Password)) != nil || !user.IsActive {
+		return utils.Fail(c, fiber.StatusUnauthorized, "invalid email or password")
 	}
 
-	refreshToken, tokenHash, err := generateRefreshToken()
+	refreshToken, tokenHash, err := utils.GenerateRefreshToken()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create refresh token"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create refresh token")
 	}
-	_, err = a.db.ExecContext(c.Context(),
+	_, err = a.db.ExecContext(ctx,
 		`INSERT INTO auth_refresh_tokens (token_hash, user_id, expires_at)
 		 VALUES ($1, $2, $3)`,
 		tokenHash, user.ID, time.Now().Add(refreshTokenDuration),
 	)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create refresh token"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create refresh token")
 	}
 	return a.writeTokens(c, user, refreshToken)
-}
-
-func (a *AuthController) Logout(c fiber.Ctx) error {
-	userID, err := a.userIDFromRequest(c)
-	if err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-	var input refreshRequest
-	if err := json.Unmarshal(c.Body(), &input); err != nil || input.RefreshToken == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "refresh_token is required"})
-	}
-	_, err = a.db.ExecContext(c.Context(),
-		`DELETE FROM auth_refresh_tokens WHERE token_hash = $1 AND user_id = $2`,
-		hashRefreshToken(input.RefreshToken), userID,
-	)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not revoke refresh token"})
-	}
-	c.Set("Cache-Control", "no-store")
-	return c.SendStatus(fiber.StatusNoContent)
 }
 
 func (a *AuthController) Refresh(c fiber.Ctx) error {
 	var input refreshRequest
-	if err := json.Unmarshal(c.Body(), &input); err != nil || input.RefreshToken == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "refresh_token is required"})
+	if err := decodeBody(c, &input); err != nil || input.RefreshToken == "" {
+		return utils.Fail(c, fiber.StatusBadRequest, "refresh_token is required")
 	}
 
-	tx, err := a.db.BeginTx(c.Context(), nil)
+	ctx, cancel := context.WithTimeout(c.Context(), a.queryTimeout)
+	defer cancel()
+
+	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not refresh session"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not refresh session")
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var user models.User
-	err = tx.QueryRowContext(c.Context(),
-		`SELECT u.id, u.name, u.email, u.created_at
+	err = tx.QueryRowContext(ctx,
+		`SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.updated_at
 		 FROM auth_refresh_tokens t
 		 JOIN users u ON u.id = t.user_id
 		 WHERE t.token_hash = $1 AND t.expires_at > NOW()
+		   AND t.revoked_at IS NULL AND u.is_active = TRUE
 		 FOR UPDATE OF t`,
-		hashRefreshToken(input.RefreshToken),
-	).Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt)
+		utils.HashRefreshToken(input.RefreshToken),
+	).Scan(&user.ID, &user.Name, &user.Email, &user.Role, &user.IsActive, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid refresh token"})
+		if a.revokeReusedToken(ctx, tx, input.RefreshToken) {
+			_ = tx.Commit()
+		}
+		return utils.Fail(c, fiber.StatusUnauthorized, "invalid refresh token")
 	}
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not refresh session"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not refresh session")
 	}
 
-	refreshToken, tokenHash, err := generateRefreshToken()
+	refreshToken, tokenHash, err := utils.GenerateRefreshToken()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create refresh token"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create refresh token")
 	}
-	if _, err := tx.ExecContext(c.Context(),
-		`DELETE FROM auth_refresh_tokens WHERE token_hash = $1`,
-		hashRefreshToken(input.RefreshToken),
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE auth_refresh_tokens SET revoked_at = NOW()
+		 WHERE token_hash = $1 AND revoked_at IS NULL`,
+		utils.HashRefreshToken(input.RefreshToken),
 	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not refresh session"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not refresh session")
 	}
-	if _, err := tx.ExecContext(c.Context(),
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO auth_refresh_tokens (token_hash, user_id, expires_at)
 		 VALUES ($1, $2, $3)`,
 		tokenHash, user.ID, time.Now().Add(refreshTokenDuration),
 	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not refresh session"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not refresh session")
 	}
 	if err := tx.Commit(); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not refresh session"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not refresh session")
 	}
 
 	return a.writeTokens(c, user, refreshToken)
 }
 
-func (a *AuthController) Me(c fiber.Ctx) error {
-	userID, err := a.userIDFromRequest(c)
-	if err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+func (a *AuthController) Logout(c fiber.Ctx) error {
+	user, ok := middleware.CurrentUser(c)
+	if !ok {
+		return utils.Fail(c, fiber.StatusUnauthorized, "unauthorized")
+	}
+	var input refreshRequest
+	if err := decodeBody(c, &input); err != nil || input.RefreshToken == "" {
+		return utils.Fail(c, fiber.StatusBadRequest, "refresh_token is required")
 	}
 
-	var user models.User
-	err = a.db.QueryRowContext(c.Context(),
-		`SELECT id, name, email, created_at FROM users WHERE id = $1`,
-		userID,
-	).Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
+	ctx, cancel := context.WithTimeout(c.Context(), a.queryTimeout)
+	defer cancel()
+	_, err := a.db.ExecContext(ctx,
+		`UPDATE auth_refresh_tokens SET revoked_at = NOW()
+		 WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL`,
+		utils.HashRefreshToken(input.RefreshToken), user.ID,
+	)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load user"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not revoke refresh token")
 	}
-	return c.JSON(user)
+	utils.NoStore(c)
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+func (a *AuthController) Me(c fiber.Ctx) error {
+	user, ok := middleware.CurrentUser(c)
+	if !ok {
+		return utils.Fail(c, fiber.StatusUnauthorized, "unauthorized")
+	}
+	return utils.OK(c, fiber.StatusOK, user.Public())
 }
 
 func (a *AuthController) writeTokens(c fiber.Ctx, user models.User, refreshToken string) error {
-	now := time.Now()
-	expiresAt := now.Add(accessTokenDuration)
-	claims := tokenClaims{RegisteredClaims: jwt.RegisteredClaims{
-		Subject:   strconv.FormatInt(user.ID, 10),
-		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(expiresAt),
-	}}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(a.jwtSecret)
+	accessToken, expiresAt, err := utils.NewAccessToken(a.jwtSecret, user, accessTokenDuration)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create access token"})
+		return utils.Fail(c, fiber.StatusInternalServerError, "could not create access token")
 	}
 
-	c.Set("Cache-Control", "no-store")
-	return c.JSON(fiber.Map{
-		"access_token":  token,
+	utils.NoStore(c)
+	return utils.OK(c, fiber.StatusOK, fiber.Map{
+		"access_token":  accessToken,
 		"token_type":    "Bearer",
-		"expires_at":    expiresAt,
+		"expires_at":    expiresAt.UTC().Format(time.RFC3339),
 		"refresh_token": refreshToken,
-		"user":          user,
+		"user":          user.Public(),
 	})
 }
 
-func generateRefreshToken() (string, string, error) {
-	random := make([]byte, 32)
-	if _, err := rand.Read(random); err != nil {
-		return "", "", err
+func (a *AuthController) revokeReusedToken(ctx context.Context, tx *sql.Tx, token string) bool {
+	var userID int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM auth_refresh_tokens
+		 WHERE token_hash = $1 AND expires_at > NOW()`,
+		utils.HashRefreshToken(token),
+	).Scan(&userID)
+	if err != nil {
+		return false
 	}
-	token := base64.RawURLEncoding.EncodeToString(random)
-	return token, hashRefreshToken(token), nil
+	_, err = tx.ExecContext(ctx,
+		`UPDATE auth_refresh_tokens SET revoked_at = NOW()
+		 WHERE user_id = $1 AND revoked_at IS NULL`,
+		userID,
+	)
+	return err == nil
 }
 
-func hashRefreshToken(token string) string {
-	hash := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(hash[:])
-}
-
-func (a *AuthController) userIDFromRequest(c fiber.Ctx) (int64, error) {
-	parts := strings.Fields(c.Get("Authorization"))
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return 0, errors.New("missing bearer token")
+func decodeBody(c fiber.Ctx, target any) error {
+	if len(c.Body()) == 0 {
+		return errors.New("empty body")
 	}
-
-	claims := new(tokenClaims)
-	token, err := jwt.ParseWithClaims(parts[1], claims, func(token *jwt.Token) (any, error) {
-		if token.Method != jwt.SigningMethodHS256 {
-			return nil, fmt.Errorf("unexpected signing method: %s", token.Method.Alg())
-		}
-		return a.jwtSecret, nil
-	})
-
-	if err != nil || !token.Valid {
-		return 0, errors.New("invalid bearer token")
-	}
-
-	userID, err := strconv.ParseInt(claims.Subject, 10, 64)
-	if err != nil || userID < 1 {
-		return 0, errors.New("invalid token subject")
-	}
-	return userID, nil
-}
-
-func validEmail(email string) bool {
-	address, err := mail.ParseAddress(email)
-	return err == nil && address.Address == email
+	return json.Unmarshal(c.Body(), target)
 }

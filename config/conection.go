@@ -4,28 +4,35 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func Connect() (*sql.DB, error) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		return nil, errors.New("DATABASE_URL is required")
-	}
-
-	db, err := sql.Open("pgx", dsn)
+func Connect(cfg Config) (*sql.DB, error) {
+	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.QueryTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, err
+		_ = db.Close()
+		return nil, errors.New("could not reach PostgreSQL: " + err.Error())
 	}
 	return db, nil
+}
+
+func Ping(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return errors.New("database connection is not available")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return db.PingContext(pingCtx)
 }

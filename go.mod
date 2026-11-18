@@ -3,6 +3,7 @@ module github.com/claudiovictors/api-rest
 go 1.27.2
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/gofiber/fiber/v3 v3.7.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.13.0

@@ -7,6 +7,8 @@ import (
 
 	"github.com/claudiovictors/api-rest/config"
 	"github.com/claudiovictors/api-rest/controllers"
+	"github.com/claudiovictors/api-rest/middleware"
+	"github.com/claudiovictors/api-rest/routes"
 	"github.com/gofiber/fiber/v3"
 	"github.com/joho/godotenv"
 )
@@ -16,26 +18,32 @@ func main() {
 		log.Fatalf("load .env: %v", err)
 	}
 
-	db, err := config.Connect()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
+
+	db, err := config.Connect(cfg)
 	if err != nil {
 		log.Fatalf("connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
-	auth, err := controllers.NewAuthController(db, os.Getenv("AUTH_SECRET"))
+	appLogger := log.New(os.Stdout, "schools-api ", log.LstdFlags|log.LUTC)
+	auth, err := controllers.NewAuthController(db, cfg.JWTSecret, cfg.QueryTimeout)
 	if err != nil {
 		log.Fatalf("configure authentication: %v", err)
 	}
+	users, err := controllers.NewUserController(db, cfg.QueryTimeout)
+	if err != nil {
+		log.Fatalf("configure users: %v", err)
+	}
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: middleware.ErrorHandler(appLogger)})
+	routes.Register(app, cfg, db, auth, users, appLogger)
 
-	app.Post("/auth/register", auth.Store)
-	app.Post("/auth/login", auth.Login)
-	app.Post("/auth/refresh", auth.Refresh)
-	app.Post("/auth/logout", auth.Logout)
-	app.Get("/auth/me", auth.Me)
-
-	if err := app.Listen(":8080"); err != nil {
+	log.Printf("listening on %s", cfg.Addr)
+	if err := app.Listen(cfg.Addr); err != nil {
 		log.Fatal(err)
 	}
 }
